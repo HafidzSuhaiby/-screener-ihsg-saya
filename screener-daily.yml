@@ -1,0 +1,44 @@
+name: Screener IHSG Harian
+
+on:
+  schedule:
+    # 01:45 UTC = 08:45 WIB, Senin-Jumat (sebelum bursa buka jam 09:00 WIB)
+    - cron: "45 1 * * 1-5"
+  workflow_dispatch: {}   # supaya bisa dites manual lewat tab "Actions" di GitHub
+
+jobs:
+  screening:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Jalankan screener & kirim notifikasi Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODAL: ${{ vars.MODAL }}
+          MIN_VOLUME: ${{ vars.MIN_VOLUME }}
+          REQUIRE_WEEKLY: ${{ vars.REQUIRE_WEEKLY }}
+          RUN_BACKTEST: ${{ vars.RUN_BACKTEST }}
+          SEKTOR_FILTER: ${{ vars.SEKTOR_FILTER }}
+        run: python notify_telegram.py
+
+      - name: Unggah hasil screening sebagai artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasil-screening-${{ github.run_id }}
+          path: hasil_screening_terbaru.csv
+          if-no-files-found: ignore
+          retention-days: 30
