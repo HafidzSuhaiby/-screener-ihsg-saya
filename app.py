@@ -1,12 +1,15 @@
 """
 ================================================================================
-SCREENER SAHAM IHSG LOKAL (v3)
+SCREENER SAHAM IHSG LOKAL (v4)
 Aplikasi berbasis Streamlit untuk screening saham IHSG. Logika inti (indikator,
 download data, backtest) ada di screener_core.py — file ini murni UI.
 
-Didesain untuk dijalankan on-demand di laptop lokal (bukan server 24 jam).
+Didesain untuk dijalankan on-demand di laptop lokal (bukan server 24 jam),
+dan bisa juga di-deploy 24/7 gratis via Streamlit Community Cloud.
 Untuk notifikasi otomatis tiap pagi tanpa buka app, lihat notify_telegram.py
 (dijalankan terjadwal via GitHub Actions, gratis).
+
+v4: + Konfirmasi Volume (toggle) + Estimasi Tanggal TP (berbasis backtest historis)
 ================================================================================
 """
 
@@ -113,6 +116,14 @@ def main():
                  "(mengurangi false-signal, tapi sinyal jadi lebih sedikit).",
         )
 
+        require_volume_confirm = st.checkbox(
+            "Wajib Konfirmasi Volume",
+            value=True,
+            help="Jika aktif, sinyal BUY wajib dibarengi volume 3 hari terakhir >= "
+                 "rata-rata volume 20 hari — menandakan ada minat beli nyata saat "
+                 "harga masuk zona RSI 40-55, bukan sekadar drift turun tanpa partisipasi pasar.",
+        )
+
         st.markdown("**Estimasi Biaya Transaksi (Broker)**")
         c_fee1, c_fee2 = st.columns(2)
         fee_buy_pct = c_fee1.number_input("Fee Beli (%)", min_value=0.0, value=0.15, step=0.01, format="%.2f")
@@ -122,7 +133,8 @@ def main():
             "Jalankan Quick Backtest untuk sinyal BUY",
             value=True,
             help="Mengecek seberapa sering pola sinyal ini historically kena TP duluan "
-                 "vs SL duluan pada saham yang sama (1 tahun terakhir). Simulasi sederhana, "
+                 "vs SL duluan pada saham yang sama (1 tahun terakhir), sekaligus estimasi "
+                 "tanggal TP berdasarkan median waktu historis. Simulasi sederhana, "
                  "bukan jaminan hasil ke depan.",
         )
 
@@ -132,13 +144,16 @@ def main():
                 help="Mencegah rate-limit dari Yahoo Finance saat mengunduh banyak batch.",
             )
             chunk_size = st.slider("Ukuran batch (jumlah saham per unduhan)", 10, 50, core.CHUNK_SIZE)
+            volume_confirm_ratio = st.number_input(
+                "Rasio minimal Volume 3D/20D untuk konfirmasi", min_value=0.1, value=1.0, step=0.1,
+                help="1.0 berarti volume 3 hari terakhir harus minimal sama dengan rata-rata 20 hari.",
+            )
 
         st.markdown("---")
         st.markdown(f"**Total saham dalam daftar:** {len(core.IHSG_TICKERS)}")
         st.markdown(
             "💡 Mau dapat sinyal BUY otomatis tiap pagi tanpa buka app ini? "
-            "Lihat `notify_telegram.py` + `.github/workflows/screener-daily.yml` "
-            "(dijalankan gratis via GitHub Actions)."
+            "Lihat `notify_telegram.py` + `.github/workflows/screener-daily.yml`."
         )
         st.markdown(
             "⚠️ Ini bukan rekomendasi investasi. Selalu lakukan riset mandiri "
@@ -168,20 +183,13 @@ def main():
         total = len(tickers_to_scan)
         state = {"processed": 0}
 
-        def on_progress(msg: str):
-            status_text.text(msg)
-
-        # NB: run_full_screening (di screener_core) melakukan batch download +
-        # analisis + backtest sekaligus, dipakai identik oleh notify_telegram.py.
-        # Progress bar di sini kita gerakkan per-chunk secara kasar karena
-        # granularitas asli ada di dalam fungsi tsb.
         chunks = list(core.chunk_list(tickers_to_scan, chunk_size))
         hasil_list, error_list = [], []
         low_liquidity_count = 0
         chart_data_cache = {}
 
         for ci, chunk in enumerate(chunks):
-            on_progress(f"⬇️ Mengunduh batch {ci + 1}/{len(chunks)} ({len(chunk)} saham)...")
+            status_text.text(f"⬇️ Mengunduh batch {ci + 1}/{len(chunks)} ({len(chunk)} saham)...")
             tickers_yf = tuple(f"{k}.JK" for k in chunk)
             try:
                 raw_batch = cached_fetch_batch_data(tickers_yf, period="1y")
@@ -193,11 +201,12 @@ def main():
                 continue
 
             for kode in chunk:
-                on_progress(f"🔍 Memproses {kode}.JK ...")
+                status_text.text(f"🔍 Memproses {kode}.JK ...")
                 df_ticker = core.extract_ticker_df(raw_batch, f"{kode}.JK")
                 hasil = core.analyze_stock(
                     kode, df_ticker, harga_maksimal, min_volume,
                     fee_buy_pct, fee_sell_pct, require_weekly,
+                    require_volume_confirm, volume_confirm_ratio,
                 )
                 if hasil is not None:
                     if "error" in hasil:
@@ -218,7 +227,7 @@ def main():
         status_text.text("✅ Analisis selesai!")
         progress_bar.empty()
 
-        # --- Quick Backtest untuk sinyal BUY ---
+        # --- Quick Backtest + Estimasi Tanggal TP untuk sinyal BUY ---
         if run_backtest:
             buy_tickers = [h["Ticker"] for h in hasil_list if h["Status"] == "✅ BUY"]
             if buy_tickers:
@@ -226,11 +235,17 @@ def main():
                 bt_status = st.empty()
                 for i, kode in enumerate(buy_tickers):
                     bt_status.text(f"🧪 Backtest historis {kode}.JK ...")
-                    n_signal, win_rate = core.quick_backtest(chart_data_cache[kode])
+                    n_signal, win_rate, median_days = core.quick_backtest(chart_data_cache[kode])
                     for h in hasil_list:
                         if h["Ticker"] == kode:
                             h["Sinyal Historis (1Y)"] = n_signal
                             h["Win Rate Historis (%)"] = win_rate if win_rate is not None else "N/A"
+                            if n_signal >= core.MIN_SIGNAL_FOR_DATE_ESTIMATE and median_days is not None:
+                                h["Median Hari ke TP"] = median_days
+                                h["Estimasi Tanggal TP"] = core.estimate_target_date(median_days)
+                            else:
+                                h["Median Hari ke TP"] = "N/A"
+                                h["Estimasi Tanggal TP"] = "Data historis kurang"
                             break
                     bt_progress.progress((i + 1) / len(buy_tickers))
                 bt_status.empty()
@@ -238,6 +253,8 @@ def main():
         for h in hasil_list:
             h.setdefault("Sinyal Historis (1Y)", 0)
             h.setdefault("Win Rate Historis (%)", "N/A")
+            h.setdefault("Median Hari ke TP", "N/A")
+            h.setdefault("Estimasi Tanggal TP", "N/A")
 
         st.session_state["chart_data_cache"] = chart_data_cache
 
@@ -300,13 +317,18 @@ def main():
             if pilihan_chart and pilihan_chart in chart_data_cache:
                 render_chart(pilihan_chart, chart_data_cache[pilihan_chart])
 
+            st.caption(
+                "ℹ️ **Tentang Estimasi Tanggal TP**: dihitung dari median hari bursa yang "
+                "dibutuhkan sinyal historis (pola trend+RSI+volume yang sama, pada saham yang "
+                "sama) untuk mencapai TP dalam 1 tahun terakhir. Ini PERKIRAAN KASAR berbasis "
+                "pola masa lalu, BUKAN prediksi atau jaminan tanggal pasti. Ditampilkan hanya "
+                "jika ada minimal 3 sinyal historis yang menang (data cukup untuk estimasi kasar)."
+            )
             if run_backtest:
                 st.caption(
-                    "ℹ️ **Tentang Win Rate Historis**: dihitung dari kejadian pola sinyal yang sama "
-                    "(trend + RSI) pada saham yang sama selama 1 tahun terakhir, lalu dicek apakah "
-                    "TP atau SL tersentuh lebih dulu. Simulasi sederhana — tidak memperhitungkan fee, "
-                    "slippage, atau overlapping trade. Sinyal historis yang sedikit (<5) kurang "
-                    "signifikan secara statistik."
+                    "ℹ️ **Tentang Win Rate Historis**: simulasi sederhana — tidak memperhitungkan "
+                    "fee, slippage, atau overlapping trade. Sinyal historis yang sedikit (<5) "
+                    "kurang signifikan secara statistik."
                 )
 
         # --- Detail Error ---

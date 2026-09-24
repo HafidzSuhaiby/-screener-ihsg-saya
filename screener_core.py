@@ -10,6 +10,12 @@ Modul ini SENGAJA tidak bergantung pada Streamlit, supaya bisa dipakai oleh:
 Memisahkan logika inti dari UI adalah praktik umum (separation of concerns)
 supaya kedua "wajah" aplikasi ini selalu memakai aturan screening yang identik
 dan tidak saling drift ketika salah satunya diubah.
+
+RIWAYAT PERUBAHAN:
+  v3   - Batch download, caching, filter likuiditas & sektor, konfirmasi trend
+         mingguan, fee, quick backtest, chart.
+  v4   - + Konfirmasi Volume (volume 3 hari terakhir vs rata-rata 20 hari)
+         + Estimasi Tanggal TP (berbasis median hari historis ke TP, dari backtest)
 ================================================================================
 """
 
@@ -32,6 +38,7 @@ import pandas_ta as ta
 # ==============================================================================
 CHUNK_SIZE = 25             # jumlah ticker per batch download
 BACKTEST_FORWARD_DAYS = 20  # window hari ke depan untuk cek TP/SL saat backtest
+MIN_SIGNAL_FOR_DATE_ESTIMATE = 3  # minimal jumlah sinyal historis supaya estimasi tanggal ditampilkan
 
 # ==============================================================================
 # DAFTAR STATIS KODE SAHAM IHSG + PEMETAAN SEKTOR (± 160 saham)
@@ -161,18 +168,25 @@ def quick_backtest(df: pd.DataFrame, forward_days: int = BACKTEST_FORWARD_DAYS):
     Backtest sederhana pada data yang sudah ditarik (tanpa request tambahan):
     cari semua kejadian historis di mana kondisi trend+RSI yang sama terpenuhi,
     lalu cek apakah TP (3x ATR) atau SL (1.5x ATR) tersentuh lebih dulu dalam
-    N hari trading ke depan.
+    N hari trading ke depan. Untuk sinyal yang menang, dicatat juga berapa hari
+    bursa yang dibutuhkan sampai TP tercapai -> dipakai untuk estimasi tanggal.
 
     KETERBATASAN (disengaja dibuat sederhana):
     - Tidak mempertimbangkan compounding / overlapping trade
     - Tidak mempertimbangkan slippage & fee
     - Sinyal yang belum hit TP/SL dalam window diabaikan (bukan dihitung loss)
+    - "Median hari ke TP" adalah RATA-RATA/MEDIAN HISTORIS, bukan prediksi pasti
     Gunakan hanya sebagai indikasi kasar, bukan jaminan performa ke depan.
 
-    Return: (jumlah_sinyal_historis, win_rate_persen atau None jika tidak ada sinyal)
+    Return: (jumlah_sinyal_historis, win_rate_persen, median_hari_ke_tp)
+        - jumlah_sinyal_historis = 0 dan dua nilai lain None jika tidak ada
+          sinyal historis ditemukan sama sekali.
+        - median_hari_ke_tp bisa None walau ada sinyal, kalau tidak ada
+          satupun yang menang (semua kalah / tidak hit apapun dalam window).
     """
     wins = 0
     total = 0
+    days_to_tp_list = []
     n = len(df)
     for i in range(200, n - forward_days):
         row = df.iloc[i]
@@ -191,13 +205,36 @@ def quick_backtest(df: pd.DataFrame, forward_days: int = BACKTEST_FORWARD_DAYS):
             if hit_tp is not None and (hit_sl is None or hit_tp <= hit_sl):
                 wins += 1
                 total += 1
+                # posisi hit_tp di dalam 'future' (0-based) + 1 = jumlah hari bursa dari sinyal
+                hari_ke_tp = future.index.get_loc(hit_tp) + 1
+                days_to_tp_list.append(hari_ke_tp)
             elif hit_sl is not None:
                 total += 1
             # jika keduanya None -> belum hit apapun dalam window, diabaikan
 
     if total == 0:
-        return 0, None
-    return total, round(wins / total * 100, 1)
+        return 0, None, None
+
+    win_rate = round(wins / total * 100, 1)
+
+    median_days = None
+    if days_to_tp_list:
+        s = sorted(days_to_tp_list)
+        mid = len(s) // 2
+        median_days = s[mid] if len(s) % 2 == 1 else (s[mid - 1] + s[mid]) / 2
+
+    return total, win_rate, median_days
+
+
+def estimate_target_date(median_hari_ke_tp: float) -> str:
+    """
+    Mengubah median hari BURSA historis ke TP menjadi perkiraan tanggal
+    kalender (melompati akhir pekan via pandas BDay). TIDAK memperhitungkan
+    hari libur nasional/bursa, jadi ini perkiraan kasar, bukan tanggal presisi.
+    """
+    n_hari = max(1, round(median_hari_ke_tp))
+    target = pd.Timestamp.today().normalize() + pd.tseries.offsets.BDay(n_hari)
+    return target.strftime("%d %b %Y")
 
 
 # ==============================================================================
@@ -211,11 +248,18 @@ def analyze_stock(
     fee_buy_pct: float,
     fee_sell_pct: float,
     require_weekly: bool,
+    require_volume_confirm: bool = True,
+    volume_confirm_ratio: float = 1.0,
 ):
     """
     Mengolah dataframe OHLCV satu saham (yang sudah didapat dari batch download)
     menjadi hasil analisis. Return None jika tidak lolos filter harga (dibuang
     dari hasil), atau dict berisi 'error' jika data bermasalah.
+
+    require_volume_confirm: kalau True, sinyal BUY WAJIB dibarengi volume
+        3 hari terakhir >= (volume_confirm_ratio x rata-rata volume 20 hari)
+        -> menandakan ada minat beli nyata saat harga masuk zona RSI 40-55,
+        bukan sekadar harga drift turun tanpa partisipasi pasar.
     """
     if df_raw is None or df_raw.empty:
         return {"error": "Data kosong (kemungkinan delisted/simbol salah)", "ticker": kode_saham}
@@ -255,7 +299,16 @@ def analyze_stock(
     wk_ok = weekly_trend_ok(df)
     syarat_weekly = True if (wk_ok is None or not require_weekly) else wk_ok
 
-    sinyal_buy = syarat_trend and syarat_rsi and syarat_weekly
+    # --- Filter #6 (baru): Konfirmasi Volume ---
+    # Rasio volume 3 hari terakhir terhadap rata-rata 20 hari. Dihitung SELALU
+    # (untuk ditampilkan sebagai info), tapi hanya dipakai sebagai syarat wajib
+    # kalau require_volume_confirm=True.
+    vol_avg_3 = float(df["Volume"].tail(3).mean())
+    vol_ratio_3_20 = round(vol_avg_3 / avg_vol_20, 2) if avg_vol_20 > 0 else 0.0
+    volume_confirmed = vol_ratio_3_20 >= volume_confirm_ratio
+    syarat_volume = volume_confirmed if require_volume_confirm else True
+
+    sinyal_buy = syarat_trend and syarat_rsi and syarat_weekly and syarat_volume
     status = "✅ BUY" if sinyal_buy else "⏸️ WATCHLIST"
 
     sl = harga_now - (1.5 * atr)
@@ -276,6 +329,8 @@ def analyze_stock(
         "RSI(14)": round(rsi, 2),
         "ATR(14)": round(atr, 2),
         "Avg Vol 20D": round(avg_vol_20, 0),
+        "Vol Ratio (3D/20D)": vol_ratio_3_20,
+        "Konfirmasi Volume": "✔️" if volume_confirmed else "✖️",
         "Target TP": round(tp, 0),
         "Batas SL": round(sl, 0),
         "Est. Profit Net (%)": round(net_profit_pct, 2),
@@ -294,6 +349,8 @@ def run_full_screening(
     fee_buy_pct: float = 0.15,
     fee_sell_pct: float = 0.25,
     require_weekly: bool = False,
+    require_volume_confirm: bool = True,
+    volume_confirm_ratio: float = 1.0,
     run_backtest: bool = True,
     chunk_size: int = CHUNK_SIZE,
     jeda_batch: float = 1.0,
@@ -301,18 +358,18 @@ def run_full_screening(
 ):
     """
     Menjalankan seluruh pipeline screening (download batch -> analisis ->
-    backtest) untuk daftar ticker yang diberikan. Dipakai bersama oleh
-    app.py maupun notify_telegram.py supaya alurnya identik.
+    backtest -> estimasi tanggal TP) untuk daftar ticker yang diberikan.
+    Dipakai bersama oleh app.py maupun notify_telegram.py supaya alurnya identik.
 
     on_progress: callback opsional dipanggil sebagai on_progress(pesan: str)
                  untuk melaporkan progres (dipakai untuk print() di script
                  headless, atau update UI di Streamlit).
 
     Return: dict berisi:
-        hasil_list        -> list of dict hasil analisis (BUY & WATCHLIST)
-        error_list         -> list of dict error/likuiditas rendah
-        low_liquidity_count -> jumlah saham yang disaring karena likuiditas
-        chart_data_cache   -> dict {ticker: df_dengan_indikator}
+        hasil_list           -> list of dict hasil analisis (BUY & WATCHLIST)
+        error_list           -> list of dict error/likuiditas rendah
+        low_liquidity_count  -> jumlah saham yang disaring karena likuiditas
+        chart_data_cache     -> dict {ticker: df_dengan_indikator}
     """
     import time as _time
 
@@ -344,6 +401,7 @@ def run_full_screening(
             hasil = analyze_stock(
                 kode, df_ticker, harga_maksimal, min_volume,
                 fee_buy_pct, fee_sell_pct, require_weekly,
+                require_volume_confirm, volume_confirm_ratio,
             )
 
             if hasil is not None:
@@ -363,16 +421,24 @@ def run_full_screening(
         buy_tickers = [h["Ticker"] for h in hasil_list if h["Status"] == "✅ BUY"]
         for kode in buy_tickers:
             _log(f"🧪 Backtest historis {kode}.JK ...")
-            n_signal, win_rate = quick_backtest(chart_data_cache[kode])
+            n_signal, win_rate, median_days = quick_backtest(chart_data_cache[kode])
             for h in hasil_list:
                 if h["Ticker"] == kode:
                     h["Sinyal Historis (1Y)"] = n_signal
                     h["Win Rate Historis (%)"] = win_rate if win_rate is not None else "N/A"
+                    if n_signal >= MIN_SIGNAL_FOR_DATE_ESTIMATE and median_days is not None:
+                        h["Median Hari ke TP"] = median_days
+                        h["Estimasi Tanggal TP"] = estimate_target_date(median_days)
+                    else:
+                        h["Median Hari ke TP"] = "N/A"
+                        h["Estimasi Tanggal TP"] = "Data historis kurang"
                     break
 
     for h in hasil_list:
         h.setdefault("Sinyal Historis (1Y)", 0)
         h.setdefault("Win Rate Historis (%)", "N/A")
+        h.setdefault("Median Hari ke TP", "N/A")
+        h.setdefault("Estimasi Tanggal TP", "N/A")
 
     return {
         "hasil_list": hasil_list,

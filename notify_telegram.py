@@ -8,15 +8,16 @@ tiap pagi via GitHub Actions terjadwal — lihat
 .github/workflows/screener-daily.yml
 
 KONFIGURASI (lewat environment variable, diisi sebagai GitHub Secrets):
-  TELEGRAM_BOT_TOKEN   (wajib) - token bot dari @BotFather
-  TELEGRAM_CHAT_ID     (wajib) - chat id tujuan notifikasi
-  MODAL                (opsional, default 150000)
-  MIN_VOLUME           (opsional, default 500000)
-  FEE_BUY_PCT          (opsional, default 0.15)
-  FEE_SELL_PCT         (opsional, default 0.25)
-  REQUIRE_WEEKLY       (opsional, "true"/"false", default "false")
-  RUN_BACKTEST         (opsional, "true"/"false", default "true")
-  SEKTOR_FILTER        (opsional, nama sektor dipisah koma; kosong = semua)
+  TELEGRAM_BOT_TOKEN     (wajib) - token bot dari @BotFather
+  TELEGRAM_CHAT_ID       (wajib) - chat id tujuan notifikasi
+  MODAL                  (opsional, default 150000)
+  MIN_VOLUME             (opsional, default 500000)
+  FEE_BUY_PCT            (opsional, default 0.15)
+  FEE_SELL_PCT           (opsional, default 0.25)
+  REQUIRE_WEEKLY         (opsional, "true"/"false", default "false")
+  REQUIRE_VOLUME_CONFIRM (opsional, "true"/"false", default "true")
+  RUN_BACKTEST           (opsional, "true"/"false", default "true")
+  SEKTOR_FILTER          (opsional, nama sektor dipisah koma; kosong = semua)
 
 Cara test lokal (tanpa GitHub Actions):
   export TELEGRAM_BOT_TOKEN="123456:ABC..."
@@ -103,14 +104,17 @@ def format_message(hasil_list, total_dianalisis, modal, harga_maksimal, run_back
         for h in buy_signals:
             block = [
                 f"*{h['Ticker']}* — {h['Sektor']}",
-                f"Harga: Rp {h['Harga Saat Ini']:,.0f} | RSI: {h['RSI(14)']}",
+                f"Harga: Rp {h['Harga Saat Ini']:,.0f} | RSI: {h['RSI(14)']} | "
+                f"Vol 3D/20D: {h['Vol Ratio (3D/20D)']}x {h['Konfirmasi Volume']}",
                 f"TP: Rp {h['Target TP']:,.0f} (net +{h['Est. Profit Net (%)']}%) | "
                 f"SL: Rp {h['Batas SL']:,.0f} (net -{h['Est. Rugi Net (%)']}%)",
             ]
             if run_backtest:
                 wr = h.get("Win Rate Historis (%)", "N/A")
                 ns = h.get("Sinyal Historis (1Y)", 0)
+                tgl = h.get("Estimasi Tanggal TP", "N/A")
                 block.append(f"Win-rate historis 1Y: {wr}% ({ns} sinyal)")
+                block.append(f"Estimasi TP tercapai: ~{tgl} (median historis, bukan jaminan)")
             lines.append("\n".join(block))
             lines.append("")
 
@@ -132,6 +136,7 @@ def main():
     fee_buy_pct = env_float("FEE_BUY_PCT", 0.15)
     fee_sell_pct = env_float("FEE_SELL_PCT", 0.25)
     require_weekly = env_bool("REQUIRE_WEEKLY", False)
+    require_volume_confirm = env_bool("REQUIRE_VOLUME_CONFIRM", True)
     run_backtest = env_bool("RUN_BACKTEST", True)
 
     sektor_filter_raw = os.environ.get("SEKTOR_FILTER", "").strip()
@@ -144,7 +149,7 @@ def main():
     harga_maksimal = modal / 100
 
     print(f"Mulai screening {len(tickers)} saham | Modal Rp{modal:,.0f} "
-          f"| Harga maks Rp{harga_maksimal:,.0f}")
+          f"| Harga maks Rp{harga_maksimal:,.0f} | Konfirmasi Volume: {require_volume_confirm}")
 
     try:
         result = core.run_full_screening(
@@ -154,6 +159,7 @@ def main():
             fee_buy_pct=fee_buy_pct,
             fee_sell_pct=fee_sell_pct,
             require_weekly=require_weekly,
+            require_volume_confirm=require_volume_confirm,
             run_backtest=run_backtest,
             on_progress=lambda msg: print(msg),
         )
